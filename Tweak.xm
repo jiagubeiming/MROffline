@@ -32,42 +32,92 @@ static NSString *gLogPath = nil;
 static NSUInteger gSeq = 0;
 static BOOL gVerbose = YES;        // 关掉可减少开销
 
+// 多个候选路径，全部试一遍；同时写 2 份互备，防止某一路径不可写
+static NSMutableArray<NSString *> *gLogPaths = nil;
+
+static NSArray<NSString *> *MRCandidateDirs(void) {
+    NSMutableArray *a = [NSMutableArray array];
+    // 1) 沙盒内 Documents —— 越狱环境下一定可写，且 Filza 能直接看到
+    @try {
+        NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+        if (paths.count) [a addObject:paths.firstObject];
+    } @catch (__unused NSException *e) {}
+    // 2) App 容器路径（TrollFools/巨魔注入后容器在 /var/mobile/Containers/Data/Application/<UUID>/）
+    @try {
+        NSString *home = NSHomeDirectory();
+        if (home.length) [a addObject:[home stringByAppendingPathComponent:@"Documents"]];
+    } @catch (__unused NSException *e) {}
+    // 3) 越狱常用可写目录
+    [a addObject:@"/var/mobile/Documents"];
+    [a addObject:@"/var/mobile/Media/MROffline"];
+    [a addObject:@"/var/tmp"];
+    [a addObject:@"/tmp"];
+    [a addObject:@"/private/var/tmp"];
+    return a;
+}
+
 static void MRLogOpen(void) {
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSArray *cands = @[@"/var/mobile/Documents",
-                       @"/var/mobile/Media/MROffline",
-                       @"/var/tmp", @"/tmp"];
-    for (NSString *c in cands) {
+    gLogPaths = [NSMutableArray array];
+
+    for (NSString *c in MRCandidateDirs()) {
+        if (!c.length) continue;
         [fm createDirectoryAtPath:c withIntermediateDirectories:YES attributes:nil error:NULL];
         NSString *p = [c stringByAppendingPathComponent:@"MROffline.log"];
-        if ([fm createFileAtPath:p contents:[NSData data] attributes:nil]) {
-            gLogPath = p;
-            break;
+
+        // 已存在就直接用（不覆盖），不存在则创建
+        if (![fm fileExistsAtPath:p]) {
+            if (![fm createFileAtPath:p contents:[NSData data] attributes:nil]) continue;
+        }
+        if (![fm isWritableFileAtPath:p]) continue;
+
+        // 去重
+        BOOL dup = NO;
+        for (NSString *x in gLogPaths) if ([x isEqualToString:p]) { dup = YES; break; }
+        if (!dup) [gLogPaths addObject:p];
+
+        // 最多留 3 个不同路径
+        if (gLogPaths.count >= 3) break;
+    }
+
+    gLogPath = gLogPaths.count ? gLogPaths.firstObject : nil;
+    NSLog(@"[MROFFLINE] log paths = %@", gLogPaths);
+}
+
+// 无条件落盘：即使 gLogPaths 为空也尝试一次
+static void MRWriteRaw(NSString *line) {
+    if (gLogPaths.count == 0) {
+        // 最后的兜底：直接 fopen 试试
+        NSString *p = @"/var/tmp/MROffline.log";
+        FILE *f = fopen([p fileSystemRepresentation], "a");
+        if (f) { fputs([line UTF8String], f); fclose(f); }
+        return;
+    }
+    NSData *d = [line dataUsingEncoding:NSUTF8StringEncoding];
+    for (NSString *p in gLogPaths) {
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:p];
+        if (!fh) continue;
+        @try {
+            [fh seekToEndOfFile];
+            [fh writeData:d];
+            [fh closeFile];
+        } @catch (__unused NSException *e) {
+            @try { [fh closeFile]; } @catch (__unused NSException *e2) {}
         }
     }
-    NSLog(@"[MROFFLINE] log = %@", gLogPath ?: @"(none)");
 }
 
 static void MRL(NSString *fmt, ...) {
-    if (!gVerbose && !gLogPath) return;
     va_list ap; va_start(ap, fmt);
     NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
 
     NSLog(@"[MROFFLINE] %@", msg);
-    if (!gLogPath) return;
 
     @synchronized ([NSProcessInfo processInfo]) {
         NSUInteger n = ++gSeq;
         NSString *line = [NSString stringWithFormat:@"%07lu %@\n", (unsigned long)n, msg];
-        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:gLogPath];
-        if (fh) {
-            @try {
-                [fh seekToEndOfFile];
-                [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
-                [fh closeFile];
-            } @catch (__unused NSException *e) {}
-        }
+        MRWriteRaw(line);
     }
 }
 
@@ -258,16 +308,35 @@ static NSData *MRRespond(NSString *path, NSInteger *statusOut, NSString **ctypeO
 @implementation MROfflineProtocol
 
 + (BOOL)canInitWithRequest:(NSURLRequest *)request {
-    if (![self propertyForKey:@"MROfflineHandled" inRequest:request]) {
-        if (MRShouldHandle(request.URL)) {
-            // 记录
-            NSString *body = request.HTTPBody
-                ? [[NSString alloc] initWithData:request.HTTPBody encoding:NSUTF8StringEncoding]
-                : nil;
-            MRL(@"REQ  %@ %@", request.HTTPMethod ?: @"?", request.URL.absoluteString);
-            if (body.length) MRL(@"     body: %@", body.length > 2000 ? [body substringToIndex:2000] : body);
-            return YES;
+    // 记录所有请求（不只 gameloft），方便判断游戏到底走不走 NSURLProtocol
+    static BOOL countedSelf = NO;
+    if (!countedSelf) {
+        countedSelf = YES;
+    }
+
+    if ([self propertyForKey:@"MROfflineHandled" inRequest:request]) return NO;
+
+    NSURL *u = request.URL;
+    NSString *h = u.host.lowercaseString ?: @"";
+    BOOL handle = MRShouldHandle(u);
+
+    // 首次出现不同 host 时记录一行「看过但没拦」
+    static NSMutableSet *seenHosts = nil;
+    if (!seenHosts) seenHosts = [NSMutableSet set];
+    @synchronized (seenHosts) {
+        if (h.length && ![seenHosts containsObject:h]) {
+            [seenHosts addObject:h];
+            MRL(@"SEEN host=%@ scheme=%@ handle=%d", h, u.scheme ?: @"?", handle ? 1 : 0);
         }
+    }
+
+    if (handle) {
+        NSString *body = request.HTTPBody
+            ? [[NSString alloc] initWithData:request.HTTPBody encoding:NSUTF8StringEncoding]
+            : nil;
+        MRL(@"REQ  %@ %@", request.HTTPMethod ?: @"?", u.absoluteString);
+        if (body.length) MRL(@"     body: %@", body.length > 2000 ? [body substringToIndex:2000] : body);
+        return YES;
     }
     return NO;
 }
@@ -311,14 +380,31 @@ static NSData *MRRespond(NSString *path, NSInteger *statusOut, NSString **ctypeO
 %ctor {
     @autoreleasepool {
         MRLogOpen();
+
+        // 无条件先把「我加载了」写下去，哪怕路径全废
         MRL(@"=== MROffline loaded (pid=%d) ===", getpid());
-        MRL(@"bundle = %@", [[NSBundle mainBundle] bundleIdentifier]);
+        MRL(@"bundle  = %@", [[NSBundle mainBundle] bundleIdentifier]);
+        MRL(@"home    = %@", NSHomeDirectory());
+        MRL(@"logs    = %@", gLogPaths);
+        MRL(@"sysver  = %@", [[UIDevice currentDevice] systemVersion]);
 
         BOOL ok = [NSURLProtocol registerClass:[MROfflineProtocol class]];
         MRL(@"registerClass = %d", ok);
 
-        // 有些 SDK 自己用 NSURLSessionConfiguration.defaultSessionConfiguration，
-        // 这里再注册一次保险（NSURLProtocol 是全局的，注册一次就够）
-        [NSURLProtocol registerClass:[MROfflineProtocol class]];
+        // ── 心跳：每 10 秒写一行，证明插件活着。
+        //    如果只看到 loaded 没有后续心跳（也没 REQ），说明插件确实没跑起来。
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)),
+                       dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0), ^{
+            static NSUInteger beat = 0;
+            @try {
+                while (YES) {
+                    beat++;
+                    MRL(@"HEARTBEAT #%lu", (unsigned long)beat);
+                    if (beat == 18) MRL(@"HEARTBEAT: 3分钟后停止心跳，避免日志过大");
+                    if (beat >= 18) break;
+                    [NSThread sleepForTimeInterval:10.0];
+                }
+            } @catch (__unused NSException *e) {}
+        });
     }
 }
