@@ -12,71 +12,77 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Theos
+      - name: Show toolchain
+        run: |
+          xcodebuild -version || true
+          xcrun --sdk iphoneos --show-sdk-path || true
+          clang++ --version || true
+
+      - name: Install Theos (logos only 需要)
         run: |
           export THEOS=$HOME/theos
           mkdir -p $THEOS
+          # 只要 logos.pl，不用它的 SDK 和打包
           git clone --recursive --depth 1 https://github.com/theos/theos.git $THEOS
+          ls -la $THEOS/bin/ | head -30
           echo "THEOS=$THEOS" >> $GITHUB_ENV
 
       - name: Install ldid
-        run: |
-          brew install ldid || true
+        run: brew install ldid || true
 
-      - name: Install iOS SDK
-        run: |
-          mkdir -p $THEOS/sdks
-          cd $THEOS/sdks
-          for v in 16.5 15.6 14.5; do
-            echo "trying iPhoneOS$v.sdk"
-            curl -fL -o sdk.zip "https://github.com/theos/sdks/raw/master/iPhoneOS$v.sdk.zip" && \
-              unzip -q -o sdk.zip && rm -f sdk.zip && echo "got $v" && break
-          done
-          ls -1
-
-      # 直接用 clang 编译 dylib，绕开 Theos 的 stage/packaging 阶段。
-      # 这样产出的就是一个可注入的 .dylib，不依赖 .deb 打包。
-      - name: Compile dylib (rootless)
+      - name: Preprocess Tweak.xm
         run: |
           set -euo pipefail
           export THEOS=$HOME/theos
-          SDK=$(ls -d $THEOS/sdks/iPhoneOS*.sdk | head -1)
+          if [ -x "$THEOS/bin/logos.pl" ]; then
+            perl "$THEOS/bin/logos.pl" Tweak.xm > Tweak.mm
+          else
+            echo "logos.pl not found, listing:"; find $THEOS -name 'logos*' | head -20; exit 1
+          fi
+          echo "--- head ---"; head -40 Tweak.mm
+          echo "--- grep ctor ---"; grep -n "ctor\|MROfflineProtocol" Tweak.mm | head -20
+
+      - name: Compile dylib
+        run: |
+          set -euo pipefail
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
           echo "SDK=$SDK"
           mkdir -p out
 
-          # 用 Theos 的 preprocessor 把 .xm 转成 .mm（%ctor/%hook 宏展开）
-          $THEOS/bin/logos.pl Tweak.xm > Tweak.mm
-          echo "--- preprocessed head ---"
-          head -40 Tweak.mm
-
           xcrun --sdk iphoneos clang++ \
             -arch arm64 \
-            -miphoneos-version-min=15.0 \
+            -miphoneos-version-min=14.0 \
             -isysroot "$SDK" \
-            -fobjc-arc -O2 -fmodules \
+            -fobjc-arc -O2 \
             -dynamiclib \
             -install_name @executable_path/MROffline.dylib \
             -framework Foundation -framework UIKit -framework CoreFoundation \
             -o out/MROffline.dylib \
-            Tweak.mm 2>&1 | tee compile.log
+            Tweak.mm
 
+          echo "=== built ==="
           ls -la out/
 
-      - name: Verify dylib
+      - name: Verify
         run: |
           set -x
-          file out/MROffline.dylib || true
-          xcrun --sdk iphoneos otool -L out/MROffline.dylib || true
-          xcrun --sdk iphoneos otool -h out/MROffline.dylib || true
-          # 列出初始化函数，确认 %ctor 存在
-          xcrun --sdk iphoneos nm -m out/MROffline.dylib | grep -i -E "ctor|MROffline" || true
-          xcrun --sdk iphoneos otool -l out/MROffline.dylib | grep -A4 __mod_init_func || true
+          file out/MROffline.dylib
+          otool -L out/MROffline.dylib
+          otool -arch arm64 -h out/MROffline.dylib | head -20
+          echo "=== ctor ==="
+          otool -l out/MROffline.dylib | grep -A6 __mod_init_func || true
+          echo "=== exported classes ==="
+          nm -m out/MROffline.dylib | grep -i "MROffline" | head -20 || true
+          echo "=== strings check ==="
+          strings out/MROffline.dylib | grep -c "MROFFLINE" || true
+          strings out/MROffline.dylib | grep "hestia" | head -5 || true
 
-      - name: Sign dylib
+      - name: Sign
         run: |
           set -e
-          ldid -S out/MROffline.dylib && echo "signed ok"
+          ldid -S out/MROffline.dylib
           cp out/MROffline.dylib out/MROffline_signed.dylib
+          ls -la out/
 
       - name: Upload
         if: always()
@@ -85,6 +91,5 @@ jobs:
           name: mroffline-dylib
           path: |
             out/
-            compile.log
             Tweak.mm
           if-no-files-found: warn
