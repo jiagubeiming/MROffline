@@ -37,10 +37,22 @@ jobs:
 
       - name: Build (rootless)
         run: |
-          set -e
+          set -euo pipefail
           make clean || true
           export THEOS_PACKAGE_SCHEME=rootless
+          # 注意：不能只写 "make ... | tee build.log"，管道会吞掉 make 的退出码
+          set -o pipefail
           make package FINALPACKAGE=1 DEBUG=0 2>&1 | tee build.log
+          test -n "$(ls -1 packages/*.deb 2>/dev/null)"
+
+      - name: Build (rootful too)
+        if: always()
+        run: |
+          set -euo pipefail
+          set -o pipefail
+          make clean || true
+          unset THEOS_PACKAGE_SCHEME
+          make package FINALPACKAGE=1 DEBUG=0 2>&1 | tee build_rootful.log || true
 
       - name: Collect
         if: always()
@@ -48,6 +60,8 @@ jobs:
           mkdir -p out
           cp -f packages/*.deb out/ 2>/dev/null || true
           find .theos -name '*.dylib' -exec cp -f {} out/ \; 2>/dev/null || true
+          cp -f build.log out/ 2>/dev/null || true
+          cp -f build_rootful.log out/ 2>/dev/null || true
           ls -la out || true
 
       - name: Upload

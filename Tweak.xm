@@ -104,7 +104,6 @@ static NSData *MRMakeHestia(void) {
     fmt.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
     fmt.timeZone = [NSTimeZone timeZoneWithName:@"UTC"];
 
-    NSString *today = [fmt stringFromDate:now];
     // 昨天开始，10 年后结束
     NSDate *past = [now dateByAddingTimeInterval:-86400 * 2];
     NSDate *far  = [now dateByAddingTimeInterval:86400.0 * 3650];
