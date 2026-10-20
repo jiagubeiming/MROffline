@@ -1,0 +1,9 @@
+Package: com.mroffline.tweak
+Name: MROffline
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: Minion Rush 离线网络层（照搬安卓 libmroffline.so 思路）
+Maintainer: local
+Author: local
+Section: Tweaks
+Depends: mobilesubstrate

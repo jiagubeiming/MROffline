@@ -1,0 +1,61 @@
+name: Build MROffline
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Theos
+        run: |
+          export THEOS=$HOME/theos
+          mkdir -p $THEOS
+          git clone --recursive --depth 1 https://github.com/theos/theos.git $THEOS
+          echo "THEOS=$THEOS" >> $GITHUB_ENV
+
+      - name: Install ldid
+        run: |
+          brew install ldid || true
+          which ldid || echo "ldid missing, will use Theos bundled"
+
+      - name: Install iOS SDK
+        run: |
+          mkdir -p $THEOS/sdks
+          cd $THEOS/sdks
+          for v in 16.5 15.6 14.5; do
+            echo "trying iPhoneOS$v.sdk"
+            curl -fL -o sdk.zip "https://github.com/theos/sdks/raw/master/iPhoneOS$v.sdk.zip" && \
+              unzip -q -o sdk.zip && rm -f sdk.zip && echo "got $v" && break
+          done
+          ls -1
+
+      - name: Build (rootless)
+        run: |
+          set -e
+          make clean || true
+          export THEOS_PACKAGE_SCHEME=rootless
+          make package FINALPACKAGE=1 DEBUG=0 2>&1 | tee build.log
+
+      - name: Collect
+        if: always()
+        run: |
+          mkdir -p out
+          cp -f packages/*.deb out/ 2>/dev/null || true
+          find .theos -name '*.dylib' -exec cp -f {} out/ \; 2>/dev/null || true
+          ls -la out || true
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mroffline-build
+          path: |
+            out/
+            build.log
+          if-no-files-found: warn
