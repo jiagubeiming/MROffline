@@ -22,7 +22,6 @@ jobs:
       - name: Install ldid
         run: |
           brew install ldid || true
-          which ldid || echo "ldid missing, will use Theos bundled"
 
       - name: Install iOS SDK
         run: |
@@ -35,41 +34,57 @@ jobs:
           done
           ls -1
 
-      - name: Build (rootless)
+      # 直接用 clang 编译 dylib，绕开 Theos 的 stage/packaging 阶段。
+      # 这样产出的就是一个可注入的 .dylib，不依赖 .deb 打包。
+      - name: Compile dylib (rootless)
         run: |
           set -euo pipefail
-          make clean || true
-          export THEOS_PACKAGE_SCHEME=rootless
-          # 注意：不能只写 "make ... | tee build.log"，管道会吞掉 make 的退出码
-          set -o pipefail
-          make package FINALPACKAGE=1 DEBUG=0 2>&1 | tee build.log
-          test -n "$(ls -1 packages/*.deb 2>/dev/null)"
-
-      - name: Build (rootful too)
-        if: always()
-        run: |
-          set -euo pipefail
-          set -o pipefail
-          make clean || true
-          unset THEOS_PACKAGE_SCHEME
-          make package FINALPACKAGE=1 DEBUG=0 2>&1 | tee build_rootful.log || true
-
-      - name: Collect
-        if: always()
-        run: |
+          export THEOS=$HOME/theos
+          SDK=$(ls -d $THEOS/sdks/iPhoneOS*.sdk | head -1)
+          echo "SDK=$SDK"
           mkdir -p out
-          cp -f packages/*.deb out/ 2>/dev/null || true
-          find .theos -name '*.dylib' -exec cp -f {} out/ \; 2>/dev/null || true
-          cp -f build.log out/ 2>/dev/null || true
-          cp -f build_rootful.log out/ 2>/dev/null || true
-          ls -la out || true
+
+          # 用 Theos 的 preprocessor 把 .xm 转成 .mm（%ctor/%hook 宏展开）
+          $THEOS/bin/logos.pl Tweak.xm > Tweak.mm
+          echo "--- preprocessed head ---"
+          head -40 Tweak.mm
+
+          xcrun --sdk iphoneos clang++ \
+            -arch arm64 \
+            -miphoneos-version-min=15.0 \
+            -isysroot "$SDK" \
+            -fobjc-arc -O2 -fmodules \
+            -dynamiclib \
+            -install_name @executable_path/MROffline.dylib \
+            -framework Foundation -framework UIKit -framework CoreFoundation \
+            -o out/MROffline.dylib \
+            Tweak.mm 2>&1 | tee compile.log
+
+          ls -la out/
+
+      - name: Verify dylib
+        run: |
+          set -x
+          file out/MROffline.dylib || true
+          xcrun --sdk iphoneos otool -L out/MROffline.dylib || true
+          xcrun --sdk iphoneos otool -h out/MROffline.dylib || true
+          # 列出初始化函数，确认 %ctor 存在
+          xcrun --sdk iphoneos nm -m out/MROffline.dylib | grep -i -E "ctor|MROffline" || true
+          xcrun --sdk iphoneos otool -l out/MROffline.dylib | grep -A4 __mod_init_func || true
+
+      - name: Sign dylib
+        run: |
+          set -e
+          ldid -S out/MROffline.dylib && echo "signed ok"
+          cp out/MROffline.dylib out/MROffline_signed.dylib
 
       - name: Upload
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: mroffline-build
+          name: mroffline-dylib
           path: |
             out/
-            build.log
+            compile.log
+            Tweak.mm
           if-no-files-found: warn
