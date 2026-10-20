@@ -386,7 +386,7 @@ static NSData *MRRespond(NSString *path, NSInteger *statusOut, NSString **ctypeO
         MRL(@"bundle  = %@", [[NSBundle mainBundle] bundleIdentifier]);
         MRL(@"home    = %@", NSHomeDirectory());
         MRL(@"logs    = %@", gLogPaths);
-        MRL(@"sysver  = %@", [[UIDevice currentDevice] systemVersion]);
+        MRL(@"sysver  = %@", [[NSProcessInfo processInfo] operatingSystemVersionString]);
 
         BOOL ok = [NSURLProtocol registerClass:[MROfflineProtocol class]];
         MRL(@"registerClass = %d", ok);
